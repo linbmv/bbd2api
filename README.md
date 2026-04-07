@@ -101,7 +101,7 @@ See [DISCLAIMER.md](DISCLAIMER.md).
 
 ## Community
 
-This project is linked and endorsed by the **[LINUX DO](https://linux.do)** community.
+The author endorses and supports the **[LINUX DO](https://linux.do)** community.
 
 ---
 
@@ -218,5 +218,5 @@ BBD_API_KEY=key1,key2,key3
 
 ## 社区
 
-本项目已在 **[LINUX DO](https://linux.do)** 社区发布，并获得社区认可。
+作者认可并支持 **[LINUX DO](https://linux.do)** 社区。
 
