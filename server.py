@@ -10,13 +10,51 @@ from threading import Lock
 # ===================== 配置 =====================
 DEBUG_MODE = os.getenv("DEBUG", "1") == "1"
 UPSTREAM_URL = os.getenv("BBD_UPSTREAM", "https://app.backboard.io/api")
-API_KEY = os.getenv("BBD_API_KEY", "")
+# 多 key：BBD_API_KEY 支持逗号分隔，自动轮换 + 故障转移
+# 例：BBD_API_KEY=key1,key2,key3
+_raw_keys = os.getenv("BBD_API_KEY", "")
+API_KEYS: list[str] = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+API_KEY = API_KEYS[0] if API_KEYS else ""  # 兼容旧引用
+
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "10088"))
 THREAD_TTL = int(os.getenv("THREAD_TTL", "1800"))  # 秒，默认30分钟
 
 app = Flask(__name__)
 lock = Lock()
+
+# ===================== Key 轮换 =====================
+_key_index = 0
+_key_lock = Lock()
+_key_failures: dict[str, int] = {}   # key -> 连续失败次数
+_KEY_FAIL_THRESHOLD = 3              # 超过此次数暂时跳过该 key
+
+def _next_key() -> str:
+    """Round-robin 取下一个可用 key，失败次数过多的暂时跳过"""
+    global _key_index
+    with _key_lock:
+        n = len(API_KEYS)
+        for _ in range(n):
+            key = API_KEYS[_key_index % n]
+            _key_index += 1
+            if _key_failures.get(key, 0) < _KEY_FAIL_THRESHOLD:
+                return key
+        # 全部 key 都超限了，重置并返回第一个
+        _key_failures.clear()
+        log("⚠️ 所有 key 均触发失败阈值，已重置计数", "WARNING")
+        return API_KEYS[0]
+
+def _mark_key_ok(key: str):
+    with _key_lock:
+        _key_failures[key] = 0
+
+def _mark_key_fail(key: str):
+    with _key_lock:
+        _key_failures[key] = _key_failures.get(key, 0) + 1
+        log(f"🔑 key ...{key[-8:]} 失败 {_key_failures[key]} 次", "WARNING")
+
+def headers_for(key: str) -> dict:
+    return {"X-API-Key": key, "Content-Type": "application/json"}
 
 GLOBAL_AID: str = ""
 thread_cache: dict[tuple, dict] = {}
@@ -29,8 +67,6 @@ _pool_lock = Lock()
 # tool_use_id → thread_id 映射：用于 tool_result 续接同一 thread
 _tool_tid_map: dict[str, str] = {}
 _tool_tid_lock = Lock()
-
-HEADERS = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
 
 # ===================== 工具函数 =====================
 def log(msg, level="INFO"):
@@ -85,7 +121,7 @@ def _create_thread_bg():
             return
         try:
             r = requests.post(f"{UPSTREAM_URL}/assistants/{GLOBAL_AID}/threads",
-                              headers=HEADERS, timeout=15)
+                              headers=headers_for(_next_key()), timeout=15)
             r.raise_for_status()
             tid = r.json()["thread_id"]
             with _pool_lock:
@@ -221,7 +257,7 @@ def get_or_create_thread(messages: list, system_text: str = "") -> tuple[str, st
         log("🆕 新建 thread（池已空）...", "INFO")
         resp = requests.post(
             f"{UPSTREAM_URL}/assistants/{GLOBAL_AID}/threads",
-            headers=HEADERS,
+            headers=headers_for(_next_key()),
             timeout=15,
         )
         resp.raise_for_status()
@@ -381,7 +417,7 @@ def list_models():
     try:
         r = requests.get(
             f"{UPSTREAM_URL}/models",
-            headers={"X-API-Key": API_KEY},
+            headers=headers_for(_next_key()),
             params={"model_type": "llm", "limit": 500},
             timeout=15,
         )
@@ -587,9 +623,26 @@ def _do_request(tid: str, text: str, stream: bool, model: str,
 
     payload = build_payload(text, stream, model)
     url = f"{UPSTREAM_URL}/threads/{tid}/messages"
-    if stream:
-        return url, requests.post(url, headers=HEADERS, json=payload, stream=True, timeout=120)
-    return url, requests.post(url, headers=HEADERS, json=payload, timeout=90)
+    last_err = None
+    for attempt in range(len(API_KEYS)):
+        key = _next_key()
+        try:
+            if stream:
+                resp = requests.post(url, headers=headers_for(key), json=payload,
+                                     stream=True, timeout=120)
+            else:
+                resp = requests.post(url, headers=headers_for(key), json=payload, timeout=90)
+            if resp.status_code == 401 or resp.status_code == 403:
+                _mark_key_fail(key)
+                log(f"🔑 key ...{key[-8:]} 认证失败({resp.status_code})，换下一个", "WARNING")
+                continue
+            _mark_key_ok(key)
+            return url, resp
+        except requests.RequestException as e:
+            _mark_key_fail(key)
+            last_err = e
+            log(f"🔑 key ...{key[-8:]} 请求异常: {e}，换下一个", "WARNING")
+    raise RuntimeError(f"所有 key 均失败: {last_err}")
 
 
 def _sync_response(up: dict, model: str, client_tools: list, tid: str = "") -> dict:
@@ -882,7 +935,7 @@ def warmup():
             log("🔥 预热...", "INFO")
             resp = requests.post(
                 f"{UPSTREAM_URL}/assistants",
-                headers=HEADERS,
+                headers=headers_for(_next_key()),
                 json={"name": "proxy-global", "system_prompt": "You are a helpful assistant."},
                 timeout=15,
             )
@@ -894,7 +947,7 @@ def warmup():
             import concurrent.futures
             def make_thread(_):
                 r = requests.post(f"{UPSTREAM_URL}/assistants/{GLOBAL_AID}/threads",
-                                  headers=HEADERS, timeout=15)
+                                  headers=headers_for(_next_key()), timeout=15)
                 r.raise_for_status()
                 return r.json()["thread_id"]
 

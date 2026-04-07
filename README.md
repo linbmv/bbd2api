@@ -27,7 +27,7 @@ python server.py
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BBD_API_KEY` | *(required)* | Your backboard.io API key |
+| `BBD_API_KEY` | *(required)* | API key(s) — comma-separated for multi-key rotation: `key1,key2,key3` |
 | `BBD_UPSTREAM` | `https://app.backboard.io/api` | Upstream API base URL |
 | `HOST` | `0.0.0.0` | Listen address |
 | `PORT` | `10088` | Listen port |
