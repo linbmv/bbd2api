@@ -1,0 +1,14 @@
+services:
+  bbd2api:
+    image: ghcr.io/${GITHUB_OWNER:-linbmv}/bbd2api:latest
+    container_name: bbd2api
+    restart: unless-stopped
+    ports:
+      - "10088:10088"
+    environment:
+      BBD_API_KEY: ${BBD_API_KEY}
+      BBD_UPSTREAM: ${BBD_UPSTREAM:-https://app.backboard.io/api}
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-10088}
+      THREAD_TTL: ${THREAD_TTL:-1800}
+      DEBUG: ${DEBUG:-0}
