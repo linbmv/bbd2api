@@ -692,6 +692,74 @@ def health():
 
 
 # ===================== 流式 SSE 生成器 =====================
+def _claude_sse(event_type: str, payload: dict | None = None) -> str:
+    # Claude-style SSE clients dispatch on the event name, not just the JSON body.
+    body = payload if payload is not None else {"type": event_type}
+    return f"event: {event_type}\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"
+
+
+def _claude_message_start(msg_id: str, model: str, input_tokens: int = 0) -> str:
+    return _claude_sse("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": None,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+        },
+    })
+
+
+def _claude_content_block_start(index: int, content_block: dict) -> str:
+    return _claude_sse("content_block_start", {
+        "type": "content_block_start",
+        "index": index,
+        "content_block": content_block,
+    })
+
+
+def _claude_content_block_stop(index: int) -> str:
+    return _claude_sse("content_block_stop", {
+        "type": "content_block_stop",
+        "index": index,
+    })
+
+
+def _claude_text_delta(index: int, text: str) -> str:
+    return _claude_sse("content_block_delta", {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "text_delta", "text": text},
+    })
+
+
+def _claude_input_json_delta(index: int, partial_json: str) -> str:
+    return _claude_sse("content_block_delta", {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "input_json_delta", "partial_json": partial_json},
+    })
+
+
+def _claude_message_delta(stop_reason: str, output_tokens: int) -> str:
+    return _claude_sse("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": output_tokens},
+    })
+
+
+def _claude_message_stop() -> str:
+    return _claude_sse("message_stop", {"type": "message_stop"})
+
+
+def _claude_ping() -> str:
+    return _claude_sse("ping", {"type": "ping"})
+
+
 def stream_claude(r, model: str, tid: str):
     """
     把上游 SSE 转为 Claude Messages API SSE 格式。
@@ -705,16 +773,16 @@ def stream_claude(r, model: str, tid: str):
     in_tool = False
     run_id = None
 
-    yield f'data: {json.dumps({"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model, "stop_reason": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})}\n\n'
-    yield f'data: {json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})}\n\n'
-    yield f'data: {json.dumps({"type": "ping"})}\n\n'
+    yield _claude_message_start(msg_id, model)
+    yield _claude_content_block_start(0, {"type": "text", "text": ""})
+    yield _claude_ping()
 
     text_block_open = True
 
     with r:
         if r.status_code >= 500:
             log(f"💥 上游500: {r.text[:100]}", "ERROR")
-            yield f'data: {json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "[upstream error]"}})}\n\n'
+            yield _claude_text_delta(0, "[upstream error]")
         else:
             r.raise_for_status()
             for line in r.iter_lines(decode_unicode=True):
@@ -738,14 +806,14 @@ def stream_claude(r, model: str, tid: str):
                     if text:
                         if not text_block_open:
                             # 之前关闭了 text block（比如进入 tool），重新开一个
-                            yield f'data: {json.dumps({"type": "content_block_start", "index": tool_index + 1, "content_block": {"type": "text", "text": ""}})}\n\n'
+                            yield _claude_content_block_start(tool_index + 1, {"type": "text", "text": ""})
                             text_block_open = True
-                        yield f'data: {json.dumps({"type": "content_block_delta", "index": 0 if not in_tool else tool_index + 1, "delta": {"type": "text_delta", "text": text}})}\n\n'
+                        yield _claude_text_delta(0 if not in_tool else tool_index + 1, text)
 
                 elif etype == "tool_call_start":
                     # 关闭当前文本 block
                     if text_block_open:
-                        yield f'data: {json.dumps({"type": "content_block_stop", "index": 0})}\n\n'
+                        yield _claude_content_block_stop(0)
                         text_block_open = False
 
                     tool_index = len(pending_tool) + 1
@@ -756,17 +824,17 @@ def stream_claude(r, model: str, tid: str):
                         "input_buf": "",
                     }
                     in_tool = True
-                    yield f'data: {json.dumps({"type": "content_block_start", "index": tool_index, "content_block": {"type": "tool_use", "id": pending_tool["id"], "name": pending_tool["name"], "input": {}}})}\n\n'
+                    yield _claude_content_block_start(tool_index, {"type": "tool_use", "id": pending_tool["id"], "name": pending_tool["name"], "input": {}})
 
                 elif etype == "tool_call_delta":
                     if in_tool and pending_tool:
                         delta_args = obj.get("tool_call", {}).get("function", {}).get("arguments", "")
                         pending_tool["input_buf"] += delta_args
-                        yield f'data: {json.dumps({"type": "content_block_delta", "index": tool_index, "delta": {"type": "input_json_delta", "partial_json": delta_args}})}\n\n'
+                        yield _claude_input_json_delta(tool_index, delta_args)
 
                 elif etype == "tool_call_end":
                     if in_tool:
-                        yield f'data: {json.dumps({"type": "content_block_stop", "index": tool_index})}\n\n'
+                        yield _claude_content_block_stop(tool_index)
                         in_tool = False
 
                 elif etype == "run_ended":
@@ -776,11 +844,11 @@ def stream_claude(r, model: str, tid: str):
 
     # 关闭尚未关闭的 block
     if text_block_open:
-        yield f'data: {json.dumps({"type": "content_block_stop", "index": 0})}\n\n'
+        yield _claude_content_block_stop(0)
 
     stop_reason = "tool_use" if pending_tool and not in_tool else "end_turn"
-    yield f'data: {json.dumps({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}})}\n\n'
-    yield f'data: {json.dumps({"type": "message_stop"})}\n\n'
+    yield _claude_message_delta(stop_reason, output_tokens)
+    yield _claude_message_stop()
 
 
 def stream_openai(r, model: str, cid: str):
@@ -924,14 +992,18 @@ def stream_claude_with_tools(r, model: str, client_tools: bool, tid: str = ""):
     input_tokens = 0
     output_tokens = 0
 
+    # Emit a valid Claude SSE prelude immediately so clients do not treat the
+    # buffered tool path as an empty or stalled response.
+    yield _claude_message_start(msg_id, model)
+    yield _claude_ping()
+
     with r:
         if r.status_code >= 500:
-            yield f'data: {json.dumps({"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model, "stop_reason": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})}\n\n'
-            yield f'data: {json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})}\n\n'
-            yield f'data: {json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "[upstream error]"}})}\n\n'
-            yield f'data: {json.dumps({"type": "content_block_stop", "index": 0})}\n\n'
-            yield f'data: {json.dumps({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}})}\n\n'
-            yield f'data: {json.dumps({"type": "message_stop"})}\n\n'
+            yield _claude_content_block_start(0, {"type": "text", "text": ""})
+            yield _claude_text_delta(0, "[upstream error]")
+            yield _claude_content_block_stop(0)
+            yield _claude_message_delta("end_turn", 0)
+            yield _claude_message_stop()
             return
         r.raise_for_status()
         for line in r.iter_lines(decode_unicode=True):
@@ -955,7 +1027,8 @@ def stream_claude_with_tools(r, model: str, client_tools: bool, tid: str = ""):
     parsed = parse_tool_response(full_text)
     _maybe_log_tool_parse(full_text, parsed)
 
-    yield f'data: {json.dumps({"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model, "stop_reason": None, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}})}\n\n'
+    # The Claude SSE prelude above already opened the stream; avoid emitting a
+    # duplicate message_start after the buffered upstream parse completes.
 
     if parsed["type"] == "tool_calls":
         log(f"🔧 流式工具调用: {[c['name'] for c in parsed['calls']]}", "INFO")
@@ -964,21 +1037,20 @@ def stream_claude_with_tools(r, model: str, client_tools: bool, tid: str = ""):
             tid_val = f"toolu_{int(time.time()*1000)}_{i}"
             tool_ids.append(tid_val)
             inp_str = json.dumps(call["input"], ensure_ascii=False)
-            yield f'data: {json.dumps({"type": "content_block_start", "index": i, "content_block": {"type": "tool_use", "id": tid_val, "name": call["name"], "input": {}}})}\n\n'
-            yield f'data: {json.dumps({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": inp_str}})}\n\n'
-            yield f'data: {json.dumps({"type": "content_block_stop", "index": i})}\n\n'
+            yield _claude_content_block_start(i, {"type": "tool_use", "id": tid_val, "name": call["name"], "input": {}})
+            yield _claude_input_json_delta(i, inp_str)
+            yield _claude_content_block_stop(i)
         if tid and tool_ids:
             _register_tool_ids(tool_ids, tid)
-        yield f'data: {json.dumps({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": output_tokens}})}\n\n'
+        yield _claude_message_delta("tool_use", output_tokens)
     else:
         text = parsed.get("text", full_text)
-        yield f'data: {json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})}\n\n'
-        yield f'data: {json.dumps({"type": "ping"})}\n\n'
-        yield f'data: {json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})}\n\n'
-        yield f'data: {json.dumps({"type": "content_block_stop", "index": 0})}\n\n'
-        yield f'data: {json.dumps({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": output_tokens}})}\n\n'
+        yield _claude_content_block_start(0, {"type": "text", "text": ""})
+        yield _claude_text_delta(0, text)
+        yield _claude_content_block_stop(0)
+        yield _claude_message_delta("end_turn", output_tokens)
 
-    yield f'data: {json.dumps({"type": "message_stop"})}\n\n'
+    yield _claude_message_stop()
 
 
 def _buffer_upstream_stream(r) -> tuple[str, int, int]:
