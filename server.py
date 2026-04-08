@@ -577,40 +577,63 @@ def inject_tool_prompt(user_text: str, tools: list) -> str:
     return result
 
 
-_JSON_RE = re.compile(r'\{.*\}', re.DOTALL)
+def _tool_calls_from_obj(obj) -> list:
+    if not isinstance(obj, dict):
+        return []
+
+    if "tool" in obj and "args" in obj:
+        return [{"name": obj["tool"], "input": obj["args"]}]
+
+    calls_raw = obj.get("calls", [])
+    if not isinstance(calls_raw, list):
+        return []
+
+    calls = []
+    for c in calls_raw:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("tool") or c.get("name", "")
+        inp = c.get("args") or c.get("parameters") or c.get("input") or {}
+        if name:
+            calls.append({"name": name, "input": inp})
+    return calls
+
+
+def _extract_json_objects(raw: str) -> list:
+    objs = []
+    decoder = json.JSONDecoder()
+    idx = 0
+
+    while idx < len(raw):
+        brace = raw.find("{", idx)
+        if brace < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(raw, brace)
+            objs.append(obj)
+            idx = end
+        except json.JSONDecodeError:
+            idx = brace + 1
+
+    return objs
+
 
 def parse_tool_response(raw: str) -> dict:
     """
-    解析 LLM 输出，支持多种格式：
-      {"tool":"name","args":{}}          单工具
-      {"calls":[{"tool":"name","args":{}}]}   多工具
-      {"type":"tool_calls","calls":[...]}     旧格式兼容
+    ?? LLM ??????????
+      {"tool":"name","args":{}}
+      {"calls":[{"tool":"name","args":{}}]}
+      ??????????????? JSON ??
+
+    ??????????????????????????????
     """
-    m = _JSON_RE.search(raw)
-    if not m:
-        return {"type": "text", "text": raw}
-    try:
-        obj = json.loads(m.group())
-    except json.JSONDecodeError:
+    if not raw:
         return {"type": "text", "text": raw}
 
-    # 单工具格式
-    if "tool" in obj and "args" in obj:
-        return {"type": "tool_calls", "calls": [{"name": obj["tool"], "input": obj["args"]}]}
-
-    # 多工具格式（新/旧）
-    calls_raw = obj.get("calls", [])
-    if calls_raw:
-        calls = []
-        for c in calls_raw:
-            name = c.get("tool") or c.get("name", "")
-            inp = c.get("args") or c.get("parameters") or c.get("input") or {}
-            calls.append({"name": name, "input": inp})
-        return {"type": "tool_calls", "calls": calls}
-
-    # 旧 type=text 格式
-    if obj.get("type") == "text":
-        return {"type": "text", "text": obj.get("content", raw)}
+    for obj in _extract_json_objects(raw):
+        tool_calls = _tool_calls_from_obj(obj)
+        if tool_calls:
+            return {"type": "tool_calls", "calls": tool_calls}
 
     return {"type": "text", "text": raw}
 
