@@ -56,17 +56,239 @@ def _mark_key_fail(key: str):
 def headers_for(key: str) -> dict:
     return {"X-API-Key": key, "Content-Type": "application/json"}
 
-GLOBAL_AID: str = ""
-thread_cache: dict[tuple, dict] = {}
+# assistant_id 按 key 维护：避免不同账号/空间的 key 混用导致 404
+assistant_map: dict[str, str] = {}  # api_key -> assistant_id
 
-# 预热 thread 池：保持 N 个空闲 thread，新对话直接取用
+GLOBAL_AID: str = ""  # 兼容旧调试字段：保存第一个初始化成功的 assistant_id
+
+# cache_key -> {thread_id, api_key, last_used}
+thread_cache: dict[tuple, dict] = {}
+# thread_id -> {api_key, assistant_id, created_at, last_used}
+thread_meta: dict[str, dict] = {}
+
+# 预热 thread 池：按 key 分桶，保证 thread 与 key 一致
 THREAD_POOL_SIZE = 4
-_thread_pool: list[str] = []   # 空闲 thread_id 列表
+_thread_pool: dict[str, list[str]] = {k: [] for k in API_KEYS}  # api_key -> [thread_id,...]
 _pool_lock = Lock()
 
 # tool_use_id → thread_id 映射：用于 tool_result 续接同一 thread
 _tool_tid_map: dict[str, str] = {}
 _tool_tid_lock = Lock()
+
+
+def _key_suffix(key: str) -> str:
+    return (key or "")[-8:]
+
+
+def _ensure_assistant_for_key(key: str) -> str:
+    """确保指定 key 对应的 assistant 已创建并返回 assistant_id。"""
+    global GLOBAL_AID
+
+    with lock:
+        aid = assistant_map.get(key)
+        if aid:
+            return aid
+
+    resp = requests.post(
+        f"{UPSTREAM_URL}/assistants",
+        headers=headers_for(key),
+        json={"name": "proxy-global", "system_prompt": "You are a helpful assistant."},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    aid = resp.json()["assistant_id"]
+    _mark_key_ok(key)
+
+    with lock:
+        assistant_map[key] = aid
+        if not GLOBAL_AID:
+            GLOBAL_AID = aid
+
+    return aid
+
+
+def _create_thread_for_key(key: str) -> str:
+    """用指定 key 创建 thread，并记录其归属。"""
+    aid = _ensure_assistant_for_key(key)
+    resp = requests.post(
+        f"{UPSTREAM_URL}/assistants/{aid}/threads",
+        headers=headers_for(key),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    tid = resp.json()["thread_id"]
+    _mark_key_ok(key)
+
+    with lock:
+        thread_meta[tid] = {
+            "api_key": key,
+            "assistant_id": aid,
+            "created_at": time.time(),
+            "last_used": time.time(),
+        }
+
+    return tid
+
+
+def _get_thread_key(tid: str) -> str | None:
+    with lock:
+        meta = thread_meta.get(tid)
+        if meta:
+            meta["last_used"] = time.time()
+            return meta.get("api_key")
+    return None
+
+
+def _mark_thread_used(tid: str):
+    with lock:
+        meta = thread_meta.get(tid)
+        if meta:
+            meta["last_used"] = time.time()
+
+
+def _remember_thread_cache(cache_key: tuple, tid: str, key: str):
+    now = time.time()
+    with lock:
+        thread_cache[cache_key] = {
+            "thread_id": tid,
+            "api_key": key,
+            "last_used": now,
+        }
+        meta = thread_meta.get(tid)
+        if meta:
+            meta["last_used"] = now
+        else:
+            thread_meta[tid] = {
+                "api_key": key,
+                "assistant_id": assistant_map.get(key, ""),
+                "created_at": now,
+                "last_used": now,
+            }
+
+
+def _pool_size_total() -> int:
+    with _pool_lock:
+        return sum(len(v) for v in _thread_pool.values())
+
+
+def _pool_size_by_key() -> dict:
+    with _pool_lock:
+        return {f"...{_key_suffix(k)}": len(v) for k, v in _thread_pool.items()}
+
+
+def _assistants_debug() -> dict:
+    with lock:
+        return {f"...{_key_suffix(k)}": aid for k, aid in assistant_map.items()}
+
+
+def _thread_debug_summary() -> dict:
+    return {
+        "global_assistant": GLOBAL_AID,
+        "assistants": _assistants_debug(),
+        "threads_cached": len(thread_cache),
+        "threads_registered": len(thread_meta),
+        "pool_size": _pool_size_total(),
+        "pool_size_by_key": _pool_size_by_key(),
+    }
+
+
+def _maybe_log_tool_parse(raw: str, parsed: dict):
+    if DEBUG_MODE:
+        preview = (raw or "")[:200].replace("\n", " ")
+        log(f"🔍 工具解析={parsed.get('type')} raw={preview}", "DEBUG")
+
+
+def _safe_print(text: str):
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", "ignore").decode("ascii"))
+
+
+def _safe_startup_banner():
+    _safe_print("\n" + "="*60)
+    _safe_print("🚀 ccc.py 启动")
+    _safe_print(f"📍 端口: {PORT}  上游: {UPSTREAM_URL}")
+    _safe_print(f"⏱️  Thread TTL: {THREAD_TTL}s")
+    _safe_print("="*60 + "\n")
+
+
+def _debug_after_tool_register():
+    if DEBUG_MODE:
+        with _tool_tid_lock:
+            n = len(_tool_tid_map)
+        log(f"🧰 tool_mappings={n}", "DEBUG")
+
+
+def _debug_after_request():
+    if DEBUG_MODE:
+        log(f"📊 {_thread_debug_summary()}", "DEBUG")
+
+
+def _debug_after_tool_result_thread(tid: str):
+    if DEBUG_MODE and tid:
+        log(f"🧰 tool_result tid={tid} key...{_key_suffix(_get_thread_key(tid) or '')}", "DEBUG")
+
+
+def _debug_warmup_state():
+    if DEBUG_MODE:
+        log(f"🤖 assistants={_assistants_debug()}", "DEBUG")
+        log(f"🏊 pool={_pool_size_by_key()}", "DEBUG")
+
+
+def _request_key_for_thread(messages: list, tid: str, tool_result: bool = False) -> str:
+    """为已存在 thread 确定其绑定 key。tool_result 场景需确保续接同一 key。"""
+    key = _get_thread_key(tid)
+    if key:
+        return key
+
+    # fallback：从缓存里尝试找回
+    history = messages[:-1]
+    hh = history_hash(history) if history else "__empty__"
+    entry = thread_cache.get((hh,))
+    key = entry.get("api_key") if entry else None
+    if key:
+        return key
+
+    raise RuntimeError(f"无法找到 thread 对应的 API key: {tid}")
+
+
+def _init_pool_buckets():
+    with _pool_lock:
+        for key in API_KEYS:
+            _thread_pool.setdefault(key, [])
+
+
+def _pool_fill_for_key(key: str, count: int):
+    tids = []
+    for _ in range(count):
+        try:
+            tids.append(_create_thread_for_key(key))
+        except Exception as e:
+            _mark_key_fail(key)
+            log(f"⚠️ 预热线程失败 key...{_key_suffix(key)}: {e}", "WARNING")
+            break
+    with _pool_lock:
+        _thread_pool.setdefault(key, []).extend(tids)
+
+
+def _warmup_all_keys():
+    _init_pool_buckets()
+    for key in API_KEYS:
+        try:
+            aid = _ensure_assistant_for_key(key)
+            log(f"✅ assistant 就绪 key...{_key_suffix(key)} aid={aid}", "SUCCESS")
+            _pool_fill_for_key(key, THREAD_POOL_SIZE)
+        except Exception as e:
+            _mark_key_fail(key)
+            log(f"⚠️ 预热失败 key...{_key_suffix(key)}: {e}", "WARNING")
+
+    _debug_warmup_state()
+
+
+# =====================================================================
+
+
 
 # ===================== 工具函数 =====================
 def log(msg, level="INFO"):
@@ -113,33 +335,35 @@ def history_hash(messages: list) -> str:
     ], ensure_ascii=False)
     return hashlib.md5(key.encode()).hexdigest()[:16]
 
-def _create_thread_bg():
-    """后台创建一个 thread 放入池"""
+def _create_thread_bg(key: str):
+    """后台为指定 key 创建一个 thread 放入池"""
     import threading
+
     def _do():
-        if not GLOBAL_AID:
-            return
         try:
-            r = requests.post(f"{UPSTREAM_URL}/assistants/{GLOBAL_AID}/threads",
-                              headers=headers_for(_next_key()), timeout=15)
-            r.raise_for_status()
-            tid = r.json()["thread_id"]
+            tid = _create_thread_for_key(key)
             with _pool_lock:
-                _thread_pool.append(tid)
-            log(f"🏊 pool+1 tid={tid} size={len(_thread_pool)}", "DEBUG")
+                _thread_pool.setdefault(key, []).append(tid)
+                size = len(_thread_pool.get(key, []))
+            log(f"🏊 pool+1 key...{_key_suffix(key)} tid={tid} size={size}", "DEBUG")
         except Exception as e:
-            log(f"⚠️ pool 补充失败: {e}", "WARNING")
+            _mark_key_fail(key)
+            log(f"⚠️ pool 补充失败 key...{_key_suffix(key)}: {e}", "WARNING")
+
     threading.Thread(target=_do, daemon=True).start()
 
-def _get_pooled_thread() -> str | None:
-    """从池里取一个空闲 thread，取出后立即异步补充"""
+
+def _get_pooled_thread(key: str) -> str | None:
+    """从指定 key 的池里取一个空闲 thread，取出后立即异步补充"""
     with _pool_lock:
-        if _thread_pool:
-            tid = _thread_pool.pop(0)
-            log(f"🏊 pool取出 tid={tid} 剩余={len(_thread_pool)}", "DEBUG")
-            # 取出一个就补一个
-            _create_thread_bg()
-            return tid
+        bucket = _thread_pool.get(key) or []
+        tid = bucket.pop(0) if bucket else None
+
+    if tid:
+        remain = len(_thread_pool.get(key, []))
+        log(f"🏊 pool取出 key...{_key_suffix(key)} tid={tid} 剩余={remain}", "DEBUG")
+        _create_thread_bg(key)
+        return tid
     return None
 
 def _register_tool_ids(tool_use_ids: list, tid: str):
@@ -209,17 +433,22 @@ def _format_tool_results(messages: list) -> str:
 
 def evict_expired_threads():
     now = time.time()
-    expired = [k for k, v in thread_cache.items() if now - v["last_used"] > THREAD_TTL]
+    expired = [k for k, v in thread_cache.items() if now - v.get("last_used", 0) > THREAD_TTL]
     for k in expired:
         del thread_cache[k]
+
+    expired_tids = [tid for tid, v in thread_meta.items() if now - v.get("last_used", 0) > THREAD_TTL]
+    for tid in expired_tids:
+        del thread_meta[tid]
 
 # ===================== 线程管理（使用全局 assistant）=====================
 def get_or_create_thread(messages: list, system_text: str = "") -> tuple[str, str]:
     """
     返回 (thread_id, message_to_send)。
-    - 使用全局 GLOBAL_AID，完全消除 assistant 创建开销
-    - system_text 前置到消息内容中（第一条消息时才加，避免重复）
-    - 用前 N-1 条消息 hash 做 thread 复用 key
+
+    关键语义：
+    - 新会话：round-robin 选择一个 key，并从该 key 的 thread 池取用/创建 thread
+    - 复用会话：沿用缓存中的 thread 与其绑定 key
     """
     if not messages:
         raise ValueError("no messages")
@@ -230,45 +459,45 @@ def get_or_create_thread(messages: list, system_text: str = "") -> tuple[str, st
     cache_key = (hh,)
 
     user_text = extract_text(last_msg.get("content", ""))
-    # 只在新对话第一条消息时把 system 前置进去
     if system_text and not history:
         user_text = f"<system>\n{system_text}\n</system>\n\n{user_text}"
 
     with lock:
         evict_expired_threads()
         entry = thread_cache.get(cache_key)
-        if entry and time.time() - entry["last_used"] <= THREAD_TTL:
+        if entry and time.time() - entry.get("last_used", 0) <= THREAD_TTL:
             tid = entry["thread_id"]
+            key = entry.get("api_key", "")
             entry["last_used"] = time.time()
-            log(f"✅ 复用 thread: {tid}", "DEBUG")
-            full_key = (history_hash(messages),)
-            thread_cache[full_key] = {"thread_id": tid, "last_used": time.time()}
+            _mark_thread_used(tid)
+            log(f"✅ 复用 thread: {tid} key...{_key_suffix(key)}", "DEBUG")
+            _remember_thread_cache((history_hash(messages),), tid, key)
             return tid, user_text
 
-    if not GLOBAL_AID:
-        raise RuntimeError("全局 assistant 尚未初始化，请稍后重试")
+    # 新会话：允许在多个 key 之间重试，避免单 key 故障导致无法创建
+    last_err = None
+    for _ in range(max(1, len(API_KEYS))):
+        key = _next_key()
+        try:
+            _ensure_assistant_for_key(key)
+            pooled = _get_pooled_thread(key)
+            if pooled:
+                tid = pooled
+                log(f"🏊 复用池 thread: {tid} key...{_key_suffix(key)}", "INFO")
+            else:
+                log(f"🆕 新建 thread（池已空）key...{_key_suffix(key)}...", "INFO")
+                tid = _create_thread_for_key(key)
+                log(f"✅ Thread: {tid}", "SUCCESS")
 
-    # 优先从池里取预热好的 thread
-    pooled = _get_pooled_thread()
-    if pooled:
-        tid = pooled
-        log(f"🏊 复用池 thread: {tid}", "INFO")
-    else:
-        log("🆕 新建 thread（池已空）...", "INFO")
-        resp = requests.post(
-            f"{UPSTREAM_URL}/assistants/{GLOBAL_AID}/threads",
-            headers=headers_for(_next_key()),
-            timeout=15,
-        )
-        resp.raise_for_status()
-        tid = resp.json()["thread_id"]
-        log(f"✅ Thread: {tid}", "SUCCESS")
+            _remember_thread_cache(cache_key, tid, key)
+            _remember_thread_cache((history_hash(messages),), tid, key)
+            return tid, user_text
+        except Exception as e:
+            last_err = e
+            _mark_key_fail(key)
+            log(f"⚠️ 创建 thread 失败 key...{_key_suffix(key)}: {e}", "WARNING")
 
-    with lock:
-        thread_cache[cache_key] = {"thread_id": tid, "last_used": time.time()}
-        thread_cache[(history_hash(messages),)] = {"thread_id": tid, "last_used": time.time()}
-
-    return tid, user_text
+    raise RuntimeError(f"无法创建 thread: {last_err}")
 
 
 # ===================== Provider 路由 =====================
@@ -454,16 +683,12 @@ def debug_clear():
 @app.route("/debug/state", methods=["GET"])
 def debug_state():
     with lock:
-        return jsonify({
-            "global_assistant": GLOBAL_AID,
-            "threads_cached": len(thread_cache),
-            "pool_size": len(_thread_pool),
-        })
+        return jsonify(_thread_debug_summary())
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "global_assistant": bool(GLOBAL_AID),
-                    "threads_cached": len(thread_cache), "pool_size": len(_thread_pool)})
+                    "threads_cached": len(thread_cache), "pool_size": _pool_size_total()})
 
 
 # ===================== 流式 SSE 生成器 =====================
@@ -611,38 +836,41 @@ def stream_openai(r, model: str, cid: str):
 
 
 # ===================== 核心接口 =====================
-def _do_request(tid: str, text: str, stream: bool, model: str,
+def _do_request(tid: str, api_key: str, text: str, stream: bool, model: str,
                 client_tools: list) -> tuple[str, any]:
     """
-    发消息到上游。有工具时强制用流式（避免大 prompt 非流式超时）。
+    发消息到上游。
+
+    关键语义：对已存在 thread，必须使用其绑定的 api_key；不能再做跨 key 轮换，
+    否则在多账号/空间 key 混用时会导致 404。
+
+    有工具时强制用流式（避免大 prompt 非流式超时）。
     """
     if client_tools:
         text = inject_tool_prompt(text, client_tools)
         log(f"🔧 tools={len(client_tools)} 注入 prompt ({len(text)} chars)", "DEBUG")
-        stream = True  # 工具请求强制流式，避免非流式超时
+        stream = True
 
     payload = build_payload(text, stream, model)
     url = f"{UPSTREAM_URL}/threads/{tid}/messages"
-    last_err = None
-    for attempt in range(len(API_KEYS)):
-        key = _next_key()
-        try:
-            if stream:
-                resp = requests.post(url, headers=headers_for(key), json=payload,
-                                     stream=True, timeout=120)
-            else:
-                resp = requests.post(url, headers=headers_for(key), json=payload, timeout=90)
-            if resp.status_code == 401 or resp.status_code == 403:
-                _mark_key_fail(key)
-                log(f"🔑 key ...{key[-8:]} 认证失败({resp.status_code})，换下一个", "WARNING")
-                continue
-            _mark_key_ok(key)
-            return url, resp
-        except requests.RequestException as e:
-            _mark_key_fail(key)
-            last_err = e
-            log(f"🔑 key ...{key[-8:]} 请求异常: {e}，换下一个", "WARNING")
-    raise RuntimeError(f"所有 key 均失败: {last_err}")
+
+    try:
+        if stream:
+            resp = requests.post(url, headers=headers_for(api_key), json=payload,
+                                 stream=True, timeout=120)
+        else:
+            resp = requests.post(url, headers=headers_for(api_key), json=payload, timeout=90)
+
+        if resp.status_code in (401, 403, 404):
+            _mark_key_fail(api_key)
+        else:
+            _mark_key_ok(api_key)
+
+        return url, resp
+
+    except requests.RequestException as e:
+        _mark_key_fail(api_key)
+        raise
 
 
 def _sync_response(up: dict, model: str, client_tools: list, tid: str = "") -> dict:
@@ -651,10 +879,12 @@ def _sync_response(up: dict, model: str, client_tools: list, tid: str = "") -> d
 
     if client_tools:
         parsed = parse_tool_response(raw)
+        _maybe_log_tool_parse(raw, parsed)
         if parsed["type"] == "tool_calls":
             blocks = tool_calls_to_claude_content(parsed["calls"])
             if tid:
                 _register_tool_ids([b["id"] for b in blocks], tid)
+                _debug_after_tool_register()
             log(f"🔧 工具调用: {[c['name'] for c in parsed['calls']]}", "INFO")
             return {
                 "id": f"msg_{int(time.time()*1000)}",
@@ -680,6 +910,9 @@ def stream_claude_with_tools(r, model: str, client_tools: bool, tid: str = ""):
     """
     有工具时：缓冲全部响应，解析 JSON，转为 SSE tool_use 事件。
     无工具时：直接流式透传。
+
+    说明：是否真正触发工具调用取决于上游 LLM 是否按注入的 JSON 约定输出。
+    为便于排障，DEBUG 模式下会记录解析命中情况与上游输出片段。
     """
     if not client_tools:
         yield from stream_claude(r, model, "")
@@ -720,6 +953,7 @@ def stream_claude_with_tools(r, model: str, client_tools: bool, tid: str = ""):
 
     full_text = "".join(buf)
     parsed = parse_tool_response(full_text)
+    _maybe_log_tool_parse(full_text, parsed)
 
     yield f'data: {json.dumps({"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model, "stop_reason": None, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}})}\n\n'
 
@@ -795,7 +1029,9 @@ def claude_messages():
             log(f"🔄 tool_result 续接 thread={tid}", "INFO")
         else:
             tid, text = get_or_create_thread(messages, sys_text)
-        _, resp = _do_request(tid, text, stream, model, client_tools)
+
+        key = _request_key_for_thread(messages, tid, tool_result=bool(tool_result_tid))
+        _, resp = _do_request(tid, key, text, stream, model, client_tools)
         # 有工具时上游强制流式；无工具时跟随客户端
         upstream_streaming = bool(client_tools) or stream
 
@@ -849,7 +1085,9 @@ def openai_compat():
             log(f"🔄 tool_result 续接 thread={tid}", "INFO")
         else:
             tid, text = get_or_create_thread(non_system, sys_text)
-        _, resp = _do_request(tid, text, stream, model, client_tools)
+
+        key = _request_key_for_thread(non_system, tid, tool_result=bool(tool_result_tid))
+        _, resp = _do_request(tid, key, text, stream, model, client_tools)
         upstream_streaming = bool(client_tools) or stream
 
         if not stream:
@@ -927,46 +1165,22 @@ def openai_compat():
 
 # ===================== 预热 =====================
 def warmup():
-    """启动时创建全局 assistant + 填满 thread 池"""
+    """启动时为每个 key 创建 assistant，并按 key 填满 thread 池"""
     import threading
+
     def _do():
-        global GLOBAL_AID
         try:
             log("🔥 预热...", "INFO")
-            resp = requests.post(
-                f"{UPSTREAM_URL}/assistants",
-                headers=headers_for(_next_key()),
-                json={"name": "proxy-global", "system_prompt": "You are a helpful assistant."},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            GLOBAL_AID = resp.json()["assistant_id"]
-            log(f"✅ 全局 assistant: {GLOBAL_AID}", "SUCCESS")
-
-            # 并行创建 THREAD_POOL_SIZE 个 thread
-            import concurrent.futures
-            def make_thread(_):
-                r = requests.post(f"{UPSTREAM_URL}/assistants/{GLOBAL_AID}/threads",
-                                  headers=headers_for(_next_key()), timeout=15)
-                r.raise_for_status()
-                return r.json()["thread_id"]
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE) as ex:
-                tids = list(ex.map(make_thread, range(THREAD_POOL_SIZE)))
-            with _pool_lock:
-                _thread_pool.extend(tids)
-            log(f"✅ 预热完成: pool={len(_thread_pool)} threads", "SUCCESS")
+            _warmup_all_keys()
+            log(f"✅ 预热完成: pool={_pool_size_total()} threads", "SUCCESS")
         except Exception as e:
             log(f"⚠️ 预热失败: {e}", "WARNING")
+
     threading.Thread(target=_do, daemon=True).start()
 
 
 # ===================== 启动 =====================
 if __name__ == "__main__":
-    print("\n" + "="*60)
-    print("🚀 ccc.py 启动")
-    print(f"📍 端口: {PORT}  上游: {UPSTREAM_URL}")
-    print(f"⏱️  Thread TTL: {THREAD_TTL}s")
-    print("="*60 + "\n")
+    _safe_startup_banner()
     warmup()
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
