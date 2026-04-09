@@ -1337,7 +1337,13 @@ def stream_claude_with_tools(r, model: str, client_tools: bool, tid: str = ""):
         _maybe_log_tool_parse(full_text, parsed)
 
     if parsed["type"] != "tool_calls" and not parsed.get("text"):
-        raise RuntimeError("upstream returned empty tool response")
+        log("empty tool response from upstream streaming path", "ERROR")
+        yield _claude_content_block_start(0, {"type": "text", "text": ""})
+        yield _claude_text_delta(0, "[upstream returned empty tool response]")
+        yield _claude_content_block_stop(0)
+        yield _claude_message_delta("end_turn", output_tokens)
+        yield _claude_message_stop()
+        return
 
     if parsed["type"] == "tool_calls":
         log(f"?? ??????: {[c['name'] for c in parsed['calls']]}", "INFO")
