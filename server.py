@@ -1326,6 +1326,35 @@ def _tool_calls_to_fake_up(tool_calls: list, input_tokens: int, output_tokens: i
     }
 
 
+def _claude_stream_from_up(up: dict, model: str, client_tools: bool, tid: str = ""):
+    msg_id = f"msg_{int(time.time()*1000)}"
+    parsed = parse_tool_response(up.get("content", "")) if client_tools else {"type": "text", "text": up.get("content", "")}
+    output_tokens = up.get("output_tokens", 0)
+
+    yield _claude_message_start(msg_id, model, up.get("input_tokens", 0))
+    yield _claude_ping()
+
+    if client_tools and parsed["type"] == "tool_calls":
+        tool_ids = []
+        for i, call in enumerate(parsed["calls"]):
+            tid_val = f"toolu_{int(time.time()*1000)}_{i}"
+            tool_ids.append(tid_val)
+            yield _claude_content_block_start(i, {"type": "tool_use", "id": tid_val, "name": call["name"], "input": {}})
+            yield _claude_input_json_delta(i, json.dumps(call["input"], ensure_ascii=False))
+            yield _claude_content_block_stop(i)
+        if tid and tool_ids:
+            _register_tool_ids(tool_ids, tid)
+        yield _claude_message_delta("tool_use", output_tokens)
+    else:
+        text_out = parsed.get("text", up.get("content", ""))
+        yield _claude_content_block_start(0, {"type": "text", "text": ""})
+        yield _claude_text_delta(0, text_out)
+        yield _claude_content_block_stop(0)
+        yield _claude_message_delta("end_turn", output_tokens)
+
+    yield _claude_message_stop()
+
+
 def stream_claude_with_tools(r, model: str, client_tools: bool, tid: str = ""):
     """
     ?????????????? JSON??? SSE tool_use ???
@@ -1501,16 +1530,35 @@ def claude_messages():
                     model,
                     client_tools,
                 )
+                collected = _buffer_upstream_stream(resp)
+
+            if not collected["tool_calls"] and not collected["text"]:
+                fake_up = {
+                    "content": "[upstream returned empty tool response after retry]",
+                    "input_tokens": collected["input_tokens"],
+                    "output_tokens": collected["output_tokens"],
+                }
+            elif collected["tool_calls"]:
+                tool_calls = [{"id": f"stream_{idx}", "name": c["name"], "input": c.get("input", {})}
+                              for idx, c in enumerate(collected["tool_calls"])]
+                cached_payload, records = _format_cached_tool_calls(conversation_id, tool_calls)
+                _record_tool_calls(conversation_id, tid, key, records)
+                fake_up = {
+                    "content": cached_payload["text"],
+                    "input_tokens": collected["input_tokens"],
+                    "output_tokens": collected["output_tokens"],
+                } if cached_payload else _tool_calls_to_fake_up(collected["tool_calls"], collected["input_tokens"], collected["output_tokens"])
             else:
-                fake_up = _tool_calls_to_fake_up(collected["tool_calls"], collected["input_tokens"], collected["output_tokens"]) if collected["tool_calls"] else {
+                fake_up = {
                     "content": collected["text"],
                     "input_tokens": collected["input_tokens"],
                     "output_tokens": collected["output_tokens"],
                 }
-                _record_checkpoint(conversation_id, "response_streaming", stop_reason="stream")
-                response = jsonify(_sync_response(fake_up, model, client_tools, tid))
-                response.headers["X-Conversation-Id"] = conversation_id
-                return response
+
+            _record_checkpoint(conversation_id, "response_streaming", stop_reason="stream")
+            return Response(_claude_stream_from_up(fake_up, model, True, tid),
+                            mimetype="text/event-stream",
+                            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Conversation-Id": conversation_id})
 
         _record_checkpoint(conversation_id, "response_streaming", stop_reason="stream")
         return Response(stream_claude_with_tools(resp, model, bool(client_tools), tid),
