@@ -3,9 +3,12 @@ import os
 import re
 import time
 import hashlib
+import traceback
 import requests
 from flask import Flask, request, Response, jsonify
 from threading import Lock
+
+from conversation_store import ConversationStore
 
 # ===================== 配置 =====================
 DEBUG_MODE = os.getenv("DEBUG", "1") == "1"
@@ -20,8 +23,37 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "10088"))
 THREAD_TTL = int(os.getenv("THREAD_TTL", "1800"))  # 秒，默认30分钟
 
+# ===================== 鉴权 =====================
+# AUTH_TOKEN 支持逗号分隔多 token，留空则不鉴权（向后兼容）
+_raw_auth = os.getenv("AUTH_TOKEN", "")
+AUTH_TOKENS: set[str] = {t.strip() for t in _raw_auth.split(",") if t.strip()}
+
 app = Flask(__name__)
 lock = Lock()
+STATE_DB_PATH = os.getenv("STATE_DB_PATH", "state.db")
+conversation_store = ConversationStore(STATE_DB_PATH)
+
+# ===================== Bearer Token 鉴权中间件 =====================
+# 免鉴权路径白名单
+_AUTH_WHITELIST = {"/health"}
+
+@app.before_request
+def _check_auth():
+    """如果配置了 AUTH_TOKEN，则要求所有非白名单请求携带 Bearer token。"""
+    if not AUTH_TOKENS:
+        return  # 未配置则跳过鉴权，向后兼容
+    if request.path in _AUTH_WHITELIST:
+        return
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if token in AUTH_TOKENS:
+            return
+    # x-api-key 头也兼容（部分客户端用这种方式）
+    xkey = request.headers.get("x-api-key", "").strip()
+    if xkey and xkey in AUTH_TOKENS:
+        return
+    return jsonify({"error": {"message": "Invalid or missing authentication token", "type": "authentication_error"}}), 401
 
 # ===================== Key 轮换 =====================
 _key_index = 0
@@ -210,6 +242,10 @@ def _safe_startup_banner():
     _safe_print("🚀 ccc.py 启动")
     _safe_print(f"📍 端口: {PORT}  上游: {UPSTREAM_URL}")
     _safe_print(f"⏱️  Thread TTL: {THREAD_TTL}s")
+    if AUTH_TOKENS:
+        _safe_print(f"🔒 鉴权: 已启用 ({len(AUTH_TOKENS)} 个 token)")
+    else:
+        _safe_print("⚠️  鉴权: 未配置 AUTH_TOKEN，所有请求均放行")
     _safe_print("="*60 + "\n")
 
 
@@ -236,9 +272,185 @@ def _debug_warmup_state():
         log(f"🏊 pool={_pool_size_by_key()}", "DEBUG")
 
 
-def _request_key_for_thread(messages: list, tid: str, tool_result: bool = False) -> str:
+def _normalize_key_id(key: str | None) -> str | None:
+    if not key:
+        return None
+    return f"...{_key_suffix(key)}"
+
+
+def _message_history_hashes(messages: list) -> list[str]:
+    hashes = []
+    if not messages:
+        return hashes
+    for idx in range(len(messages) + 1):
+        history = messages[:idx]
+        hashes.append(history_hash(history) if history else "__empty__")
+    return hashes
+
+
+def _extract_tool_result_entries(messages: list) -> list[dict]:
+    if not messages:
+        return []
+    last = messages[-1]
+    entries = []
+
+    if last.get("role") == "tool":
+        tool_use_id = last.get("tool_call_id", "")
+        if tool_use_id:
+            entries.append({
+                "tool_use_id": tool_use_id,
+                "content": last.get("content", ""),
+            })
+        return entries
+
+    if last.get("role") != "user":
+        return entries
+
+    for block in (last.get("content") or []):
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            entries.append({
+                "tool_use_id": block.get("tool_use_id", ""),
+                "content": block.get("content", ""),
+            })
+    return entries
+
+
+def _extract_tool_use_ids(messages: list) -> list[str]:
+    ids = []
+    for entry in _extract_tool_result_entries(messages):
+        tool_use_id = entry.get("tool_use_id")
+        if tool_use_id:
+            ids.append(tool_use_id)
+    return ids
+
+
+def _is_tool_conversation(messages: list) -> bool:
+    for message in messages or []:
+        role = message.get("role")
+        if role == "tool":
+            return True
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in {"tool_use", "tool_result"}:
+                    return True
+    return False
+
+
+def _resolve_conversation_id(messages: list) -> str:
+    explicit = request.headers.get("X-Conversation-Id") or request.args.get("conversation_id")
+    history_hashes = _message_history_hashes(messages)
+    tool_use_ids = _extract_tool_use_ids(messages)
+    conversation_id = conversation_store.resolve_conversation_id(explicit, history_hashes, tool_use_ids)
+    conversation_store.remember_history_hashes(conversation_id, history_hashes)
+    return conversation_id
+
+
+def _record_checkpoint(conversation_id: str, kind: str, **payload):
+    conversation_store.record_checkpoint(conversation_id, kind, payload)
+
+
+def _remember_thread_binding(conversation_id: str, tid: str, key: str | None):
+    if not conversation_id or not tid:
+        return
+    meta = thread_meta.get(tid, {})
+    conversation_store.bind_thread(
+        conversation_id,
+        tid,
+        _normalize_key_id(key),
+        meta.get("assistant_id"),
+    )
+
+
+def _tool_dedupe_key(conversation_id: str, name: str, payload: dict) -> str:
+    serialized = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
+    base = f"{conversation_id}:{name}:{serialized}"
+    return hashlib.sha256(base.encode()).hexdigest()[:24]
+
+
+def _record_tool_calls(conversation_id: str, tid: str, key: str | None, calls: list[dict]):
+    if not conversation_id or not calls:
+        return
+    records = []
+    for call in calls:
+        records.append({
+            "id": call["id"],
+            "name": call["name"],
+            "input": call.get("input", {}),
+            "dedupe_key": _tool_dedupe_key(conversation_id, call["name"], call.get("input", {})),
+        })
+    conversation_store.record_tool_calls(conversation_id, tid, _normalize_key_id(key), records)
+    _record_checkpoint(conversation_id, "tool_calls_emitted", count=len(records), thread_id=tid)
+
+
+def _record_tool_results(conversation_id: str, messages: list):
+    entries = _extract_tool_result_entries(messages)
+    if not conversation_id or not entries:
+        return
+    conversation_store.mark_tool_results(conversation_id, entries)
+    _record_checkpoint(conversation_id, "tool_results_received", count=len(entries))
+
+
+def _recovery_context(conversation_id: str) -> dict:
+    return {
+        "conversation_id": conversation_id,
+        "checkpoints": conversation_store.get_recent_checkpoints(conversation_id, limit=8),
+        "tool_activity": conversation_store.get_recent_tool_activity(conversation_id, limit=8),
+    }
+
+
+def _seed_messages_from_text(text: str) -> list[dict]:
+    return [{"role": "user", "content": text}]
+
+
+def _key_from_id(key_id: str | None) -> str | None:
+    if not key_id:
+        return None
+    if key_id in API_KEYS:
+        return key_id
+    suffix = key_id[3:] if key_id.startswith("...") else key_id
+    for key in API_KEYS:
+        if _key_suffix(key) == suffix or key.endswith(suffix):
+            return key
+    return None
+
+
+def _restore_thread_binding(tid: str | None = None,
+                            conversation_id: str | None = None) -> tuple[str | None, str | None]:
+    binding = conversation_store.get_thread_binding(tid) if tid else None
+    if not binding and conversation_id:
+        binding = conversation_store.get_latest_binding(conversation_id)
+    if not binding:
+        return tid, None
+
+    restored_tid = binding.get("thread_id") or tid
+    key = _key_from_id(binding.get("key_id"))
+    if not restored_tid or not key:
+        return restored_tid, key
+
+    now = time.time()
+    with lock:
+        meta = thread_meta.get(restored_tid, {})
+        thread_meta[restored_tid] = {
+            "api_key": key,
+            "assistant_id": binding.get("assistant_id") or meta.get("assistant_id", ""),
+            "created_at": meta.get("created_at", now),
+            "last_used": now,
+        }
+    return restored_tid, key
+
+
+
+def _request_key_for_thread(messages: list, tid: str, tool_result: bool = False,
+                            conversation_id: str | None = None) -> str:
     """为已存在 thread 确定其绑定 key。tool_result 场景需确保续接同一 key。"""
     key = _get_thread_key(tid)
+    if key:
+        return key
+
+    _, key = _restore_thread_binding(tid=tid, conversation_id=conversation_id)
     if key:
         return key
 
@@ -442,13 +654,14 @@ def evict_expired_threads():
         del thread_meta[tid]
 
 # ===================== 线程管理（使用全局 assistant）=====================
-def get_or_create_thread(messages: list, system_text: str = "") -> tuple[str, str]:
+def get_or_create_thread(messages: list, system_text: str = "", conversation_id: str | None = None,
+                         allow_persisted: bool = True) -> tuple[str, str]:
     """
-    返回 (thread_id, message_to_send)。
+    ?? (thread_id, message_to_send)?
 
-    关键语义：
-    - 新会话：round-robin 选择一个 key，并从该 key 的 thread 池取用/创建 thread
-    - 复用会话：沿用缓存中的 thread 与其绑定 key
+    ?????
+    - ????round-robin ???? key???? key ? thread ???/?? thread
+    - ??????????? thread ???? key
     """
     if not messages:
         raise ValueError("no messages")
@@ -470,11 +683,18 @@ def get_or_create_thread(messages: list, system_text: str = "") -> tuple[str, st
             key = entry.get("api_key", "")
             entry["last_used"] = time.time()
             _mark_thread_used(tid)
-            log(f"✅ 复用 thread: {tid} key...{_key_suffix(key)}", "DEBUG")
+            log(f"? ?? thread: {tid} key...{_key_suffix(key)}", "DEBUG")
             _remember_thread_cache((history_hash(messages),), tid, key)
             return tid, user_text
 
-    # 新会话：允许在多个 key 之间重试，避免单 key 故障导致无法创建
+    if allow_persisted and conversation_id:
+        tid, key = _restore_thread_binding(conversation_id=conversation_id)
+        if tid and key:
+            _remember_thread_cache(cache_key, tid, key)
+            _remember_thread_cache((history_hash(messages),), tid, key)
+            log(f"?? ????? thread: {tid} key...{_key_suffix(key)}", "INFO")
+            return tid, user_text
+
     last_err = None
     for _ in range(max(1, len(API_KEYS))):
         key = _next_key()
@@ -483,11 +703,11 @@ def get_or_create_thread(messages: list, system_text: str = "") -> tuple[str, st
             pooled = _get_pooled_thread(key)
             if pooled:
                 tid = pooled
-                log(f"🏊 复用池 thread: {tid} key...{_key_suffix(key)}", "INFO")
+                log(f"?? ??? thread: {tid} key...{_key_suffix(key)}", "INFO")
             else:
-                log(f"🆕 新建 thread（池已空）key...{_key_suffix(key)}...", "INFO")
+                log(f"?? ?? thread?????key...{_key_suffix(key)}...", "INFO")
                 tid = _create_thread_for_key(key)
-                log(f"✅ Thread: {tid}", "SUCCESS")
+                log(f"? Thread: {tid}", "SUCCESS")
 
             _remember_thread_cache(cache_key, tid, key)
             _remember_thread_cache((history_hash(messages),), tid, key)
@@ -495,12 +715,10 @@ def get_or_create_thread(messages: list, system_text: str = "") -> tuple[str, st
         except Exception as e:
             last_err = e
             _mark_key_fail(key)
-            log(f"⚠️ 创建 thread 失败 key...{_key_suffix(key)}: {e}", "WARNING")
+            log(f"?? ?? thread ?? key...{_key_suffix(key)}: {e}", "WARNING")
 
-    raise RuntimeError(f"无法创建 thread: {last_err}")
+    raise RuntimeError(f"???? thread: {last_err}")
 
-
-# ===================== Provider 路由 =====================
 def resolve_provider(model: str) -> tuple[str, str]:
     if model.startswith("claude"):
         return "anthropic", model
@@ -707,6 +925,16 @@ def debug_clear():
 def debug_state():
     with lock:
         return jsonify(_thread_debug_summary())
+
+
+@app.route("/debug/conversations/<conversation_id>", methods=["GET"])
+def debug_conversation(conversation_id: str):
+    return jsonify({
+        "conversation_id": conversation_id,
+        "binding": conversation_store.get_latest_binding(conversation_id),
+        "checkpoints": conversation_store.get_recent_checkpoints(conversation_id, limit=20),
+        "tool_activity": conversation_store.get_recent_tool_activity(conversation_id, limit=20),
+    })
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -997,21 +1225,86 @@ def _sync_response(up: dict, model: str, client_tools: list, tid: str = "") -> d
     }
 
 
+def _collect_upstream_stream(r) -> dict:
+    text_parts = []
+    tool_calls = []
+    input_tokens = output_tokens = 0
+    pending_tool = None
+
+    with r:
+        r.raise_for_status()
+        for line in r.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            raw = line[6:]
+            if raw == "[DONE]":
+                break
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+
+            etype = obj.get("type")
+            if etype == "content_streaming":
+                text_parts.append(obj.get("content", ""))
+            elif etype == "tool_call_start":
+                tc = obj.get("tool_call", {})
+                pending_tool = {
+                    "id": tc.get("id", f"toolu_{int(time.time()*1000)}"),
+                    "name": tc.get("function", {}).get("name", ""),
+                    "input": {},
+                    "input_buf": "",
+                }
+            elif etype == "tool_call_delta" and pending_tool:
+                delta_args = obj.get("tool_call", {}).get("function", {}).get("arguments", "")
+                pending_tool["input_buf"] += delta_args
+            elif etype == "tool_call_end" and pending_tool:
+                if pending_tool["input_buf"]:
+                    try:
+                        pending_tool["input"] = json.loads(pending_tool["input_buf"])
+                    except json.JSONDecodeError:
+                        pending_tool["input"] = {"_raw": pending_tool["input_buf"]}
+                tool_calls.append({
+                    "id": pending_tool["id"],
+                    "name": pending_tool["name"],
+                    "input": pending_tool["input"],
+                })
+                pending_tool = None
+            elif etype == "run_ended":
+                input_tokens = obj.get("input_tokens", 0)
+                output_tokens = obj.get("output_tokens", 0)
+                break
+
+    return {
+        "text": "".join(text_parts),
+        "tool_calls": tool_calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
+def _tool_calls_to_fake_up(tool_calls: list, input_tokens: int, output_tokens: int) -> dict:
+    calls = [
+        {"tool": call["name"], "args": call.get("input", {})}
+        for call in tool_calls
+    ]
+    return {
+        "content": json.dumps({"calls": calls}, ensure_ascii=False),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
 def stream_claude_with_tools(r, model: str, client_tools: bool, tid: str = ""):
     """
-    有工具时：缓冲全部响应，解析 JSON，转为 SSE tool_use 事件。
-    无工具时：直接流式透传。
-
-    说明：是否真正触发工具调用取决于上游 LLM 是否按注入的 JSON 约定输出。
-    为便于排障，DEBUG 模式下会记录解析命中情况与上游输出片段。
+    ?????????????? JSON??? SSE tool_use ???
+    ????????????
     """
     if not client_tools:
         yield from stream_claude(r, model, "")
         return
 
-    # 缓冲收集完整响应文本
     msg_id = f"msg_{int(time.time()*1000)}"
-    buf = []
     input_tokens = 0
     output_tokens = 0
 
@@ -1028,33 +1321,26 @@ def stream_claude_with_tools(r, model: str, client_tools: bool, tid: str = ""):
             yield _claude_message_delta("end_turn", 0)
             yield _claude_message_stop()
             return
-        r.raise_for_status()
-        for line in r.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data: "):
-                continue
-            raw = line[6:]
-            if raw == "[DONE]":
-                break
-            try:
-                obj = json.loads(raw)
-                if obj.get("type") == "content_streaming":
-                    buf.append(obj.get("content", ""))
-                elif obj.get("type") == "run_ended":
-                    input_tokens = obj.get("input_tokens", 0)
-                    output_tokens = obj.get("output_tokens", 0)
-                    break
-            except Exception:
-                pass
+        collected = _collect_upstream_stream(r)
+        input_tokens = collected["input_tokens"]
+        output_tokens = collected["output_tokens"]
 
-    full_text = "".join(buf)
-    parsed = parse_tool_response(full_text)
-    _maybe_log_tool_parse(full_text, parsed)
+    if collected["tool_calls"]:
+        parsed = {
+            "type": "tool_calls",
+            "calls": [{"name": c["name"], "input": c.get("input", {})} for c in collected["tool_calls"]],
+        }
+        _maybe_log_tool_parse(_tool_calls_to_fake_up(collected["tool_calls"], input_tokens, output_tokens)["content"], parsed)
+    else:
+        full_text = collected["text"]
+        parsed = parse_tool_response(full_text)
+        _maybe_log_tool_parse(full_text, parsed)
 
-    # The Claude SSE prelude above already opened the stream; avoid emitting a
-    # duplicate message_start after the buffered upstream parse completes.
+    if parsed["type"] != "tool_calls" and not parsed.get("text"):
+        raise RuntimeError("upstream returned empty tool response")
 
     if parsed["type"] == "tool_calls":
-        log(f"🔧 流式工具调用: {[c['name'] for c in parsed['calls']]}", "INFO")
+        log(f"?? ??????: {[c['name'] for c in parsed['calls']]}", "INFO")
         tool_ids = []
         for i, call in enumerate(parsed["calls"]):
             tid_val = f"toolu_{int(time.time()*1000)}_{i}"
@@ -1067,38 +1353,18 @@ def stream_claude_with_tools(r, model: str, client_tools: bool, tid: str = ""):
             _register_tool_ids(tool_ids, tid)
         yield _claude_message_delta("tool_use", output_tokens)
     else:
-        text = parsed.get("text", full_text)
+        text_out = parsed.get("text", collected["text"])
         yield _claude_content_block_start(0, {"type": "text", "text": ""})
-        yield _claude_text_delta(0, text)
+        yield _claude_text_delta(0, text_out)
         yield _claude_content_block_stop(0)
         yield _claude_message_delta("end_turn", output_tokens)
 
     yield _claude_message_stop()
 
 
-def _buffer_upstream_stream(r) -> tuple[str, int, int]:
-    """缓冲上游流式响应，返回 (full_text, input_tokens, output_tokens)"""
-    buf = []
-    input_tokens = output_tokens = 0
-    with r:
-        r.raise_for_status()
-        for line in r.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data: "):
-                continue
-            raw = line[6:]
-            if raw == "[DONE]":
-                break
-            try:
-                obj = json.loads(raw)
-                if obj.get("type") == "content_streaming":
-                    buf.append(obj.get("content", ""))
-                elif obj.get("type") == "run_ended":
-                    input_tokens = obj.get("input_tokens", 0)
-                    output_tokens = obj.get("output_tokens", 0)
-                    break
-            except Exception:
-                pass
-    return "".join(buf), input_tokens, output_tokens
+def _buffer_upstream_stream(r) -> dict:
+    """?????????????? tool_call ???"""
+    return _collect_upstream_stream(r)
 
 
 @app.route("/v1/messages", methods=["POST"])
@@ -1110,49 +1376,89 @@ def claude_messages():
     stream = data.get("stream", False)
     client_tools = data.get("tools", [])
 
-    log(f"📥 /v1/messages model={model} stream={stream} msgs={len(messages)} tools={len(client_tools)}", "INFO")
+    log(f"?? /v1/messages model={model} stream={stream} msgs={len(messages)} tools={len(client_tools)}", "INFO")
     if not messages:
         return jsonify({"error": "no messages"}), 400
 
     try:
+        conversation_id = _resolve_conversation_id(messages)
+        _record_checkpoint(conversation_id, "request_received",
+                           model=model, stream=stream, tools=len(client_tools), messages=len(messages))
+
         sys_text = stable_system_text(system)
-        # 检测是否为 tool_result 续接轮次
         tool_result_tid = _find_tool_result_thread(messages)
         if tool_result_tid:
             tid = tool_result_tid
-            text = _format_tool_results(messages)
-            log(f"🔄 tool_result 续接 thread={tid}", "INFO")
+            text_to_send = _format_tool_results(messages)
+            _record_tool_results(conversation_id, messages)
+            log(f"?? tool_result ?? thread={tid}", "INFO")
         else:
-            tid, text = get_or_create_thread(messages, sys_text)
+            try:
+                tid, text_to_send = get_or_create_thread(messages, sys_text, conversation_id=conversation_id)
+            except Exception as exc:
+                if _is_tool_conversation(messages):
+                    raise
+                recovery = _recovery_context(conversation_id)
+                _record_checkpoint(conversation_id, "rebuild_attempted", reason=str(exc))
+                tid, text_to_send = get_or_create_thread(messages[-1:], sys_text, conversation_id=conversation_id, allow_persisted=False)
+                text_to_send = _recovery_text(conversation_id, text_to_send)
 
-        key = _request_key_for_thread(messages, tid, tool_result=bool(tool_result_tid))
-        _, resp = _do_request(tid, key, text, stream, model, client_tools)
-        # 有工具时上游强制流式；无工具时跟随客户端
+        _remember_thread_binding(conversation_id, tid, _get_thread_key(tid))
+        _record_checkpoint(conversation_id, "thread_bound", thread_id=tid)
+
+        key = _request_key_for_thread(messages, tid, tool_result=bool(tool_result_tid), conversation_id=conversation_id)
+        _remember_thread_binding(conversation_id, tid, key)
+        _, resp = _do_request(tid, key, text_to_send, stream, model, client_tools)
         upstream_streaming = bool(client_tools) or stream
 
         if not stream:
             if upstream_streaming:
-                # 工具场景：缓冲流式响应后返回同步
                 if resp.status_code >= 500:
-                    log(f"💥 上游500", "ERROR")
+                    log(f"?? ??500", "ERROR")
                     return jsonify({"error": "upstream error"}), 502
-                full_text, in_tok, out_tok = _buffer_upstream_stream(resp)
-                fake_up = {"content": full_text, "input_tokens": in_tok, "output_tokens": out_tok}
-                return jsonify(_sync_response(fake_up, model, client_tools, tid))
+                collected = _buffer_upstream_stream(resp)
+                if collected["tool_calls"]:
+                    tool_calls = [{"id": f"synthetic_{idx}", "name": c["name"], "input": c.get("input", {})}
+                                  for idx, c in enumerate(collected["tool_calls"])]
+                    cached_payload, records = _format_cached_tool_calls(conversation_id, tool_calls)
+                    _record_tool_calls(conversation_id, tid, key, records)
+                    if cached_payload:
+                        fake_up = {
+                            "content": cached_payload["text"],
+                            "input_tokens": collected["input_tokens"],
+                            "output_tokens": collected["output_tokens"],
+                        }
+                    else:
+                        fake_up = _tool_calls_to_fake_up(collected["tool_calls"], collected["input_tokens"], collected["output_tokens"])
+                else:
+                    if not collected["text"]:
+                        raise RuntimeError("upstream returned empty tool response")
+                    fake_up = {
+                        "content": collected["text"],
+                        "input_tokens": collected["input_tokens"],
+                        "output_tokens": collected["output_tokens"],
+                    }
+                _record_checkpoint(conversation_id, "response_buffered", stop_reason="sync")
+                response = jsonify(_sync_response(fake_up, model, client_tools, tid))
             else:
                 if resp.status_code >= 500:
-                    log(f"💥 上游500: {resp.text[:200]}", "ERROR")
+                    log(f"?? ??500: {resp.text[:200]}", "ERROR")
                     return jsonify({"error": "upstream error"}), 502
                 resp.raise_for_status()
-                return jsonify(_sync_response(resp.json(), model, client_tools, tid))
+                _record_checkpoint(conversation_id, "response_buffered", stop_reason="sync")
+                response = jsonify(_sync_response(resp.json(), model, client_tools, tid))
 
+            response.headers["X-Conversation-Id"] = conversation_id
+            return response
+
+        _record_checkpoint(conversation_id, "response_streaming", stop_reason="stream")
         return Response(stream_claude_with_tools(resp, model, bool(client_tools), tid),
                         mimetype="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Conversation-Id": conversation_id})
 
     except Exception as e:
-        log(f"❌ 接口异常: {e}", "ERROR")
-        import traceback; traceback.print_exc()
+        log(f"? ????: {e}", "ERROR")
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 502
 
 
@@ -1167,29 +1473,53 @@ def openai_compat():
                       "You are a helpful assistant.")
     non_system = [m for m in messages if m.get("role") != "system"]
 
-    log(f"📥 /v1/chat/completions model={model} stream={stream} msgs={len(non_system)} tools={len(client_tools)}", "INFO")
+    log(f"?? /v1/chat/completions model={model} stream={stream} msgs={len(non_system)} tools={len(client_tools)}", "INFO")
     if not non_system:
         return jsonify({"error": "no messages"}), 400
 
     try:
+        conversation_id = _resolve_conversation_id(non_system)
+        _record_checkpoint(conversation_id, "request_received",
+                           model=model, stream=stream, tools=len(client_tools), messages=len(non_system))
         sys_text = stable_system_text(system_msg)
         tool_result_tid = _find_tool_result_thread(non_system)
         if tool_result_tid:
             tid = tool_result_tid
-            text = _format_tool_results(non_system)
-            log(f"🔄 tool_result 续接 thread={tid}", "INFO")
+            text_to_send = _format_tool_results(non_system)
+            _record_tool_results(conversation_id, non_system)
+            log(f"?? tool_result ?? thread={tid}", "INFO")
         else:
-            tid, text = get_or_create_thread(non_system, sys_text)
+            try:
+                tid, text_to_send = get_or_create_thread(non_system, sys_text, conversation_id=conversation_id)
+            except Exception as exc:
+                if _is_tool_conversation(non_system):
+                    raise
+                recovery = _recovery_context(conversation_id)
+                _record_checkpoint(conversation_id, "rebuild_attempted", reason=str(exc))
+                tid, text_to_send = get_or_create_thread(non_system[-1:], sys_text, conversation_id=conversation_id, allow_persisted=False)
+                text_to_send = _recovery_text(conversation_id, text_to_send)
 
-        key = _request_key_for_thread(non_system, tid, tool_result=bool(tool_result_tid))
-        _, resp = _do_request(tid, key, text, stream, model, client_tools)
+        _remember_thread_binding(conversation_id, tid, _get_thread_key(tid))
+        _record_checkpoint(conversation_id, "thread_bound", thread_id=tid)
+        key = _request_key_for_thread(non_system, tid, tool_result=bool(tool_result_tid), conversation_id=conversation_id)
+        _remember_thread_binding(conversation_id, tid, key)
+        _, resp = _do_request(tid, key, text_to_send, stream, model, client_tools)
         upstream_streaming = bool(client_tools) or stream
 
         if not stream:
             if upstream_streaming:
                 if resp.status_code >= 500:
                     return jsonify({"error": "upstream error"}), 502
-                full_text, in_tok, out_tok = _buffer_upstream_stream(resp)
+                collected = _buffer_upstream_stream(resp)
+                in_tok, out_tok = collected["input_tokens"], collected["output_tokens"]
+                if collected["tool_calls"]:
+                    parsed = {"type": "tool_calls", "calls": [{"name": c["name"], "input": c.get("input", {})} for c in collected["tool_calls"]]}
+                    full_text = ""
+                else:
+                    if not collected["text"]:
+                        raise RuntimeError("upstream returned empty tool response")
+                    parsed = parse_tool_response(collected["text"])
+                    full_text = parsed.get("text", collected["text"])
             else:
                 if resp.status_code >= 500:
                     return jsonify({"error": "upstream error"}), 502
@@ -1197,18 +1527,30 @@ def openai_compat():
                 up = resp.json()
                 full_text = up.get("content", "")
                 in_tok, out_tok = up.get("input_tokens", 0), up.get("output_tokens", 0)
+                parsed = parse_tool_response(full_text) if client_tools else {"type": "text", "text": full_text}
 
-            if client_tools:
-                parsed = parse_tool_response(full_text)
-                if parsed["type"] == "tool_calls":
+            if client_tools and parsed["type"] == "tool_calls":
+                calls = [{"id": f"call_{i}", "name": c["name"], "input": c["input"]} for i, c in enumerate(parsed["calls"])]
+                cached_payload, records = _format_cached_tool_calls(conversation_id, calls)
+                _record_tool_calls(conversation_id, tid, key, records)
+                if cached_payload:
+                    final_text = cached_payload["text"]
+                    response = jsonify({
+                        "id": f"chatcmpl-{int(time.time()*1000)}",
+                        "object": "chat.completion",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": final_text},
+                                     "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok},
+                    })
+                else:
                     oai_tc = [
-                        {"id": f"call_{i}", "type": "function",
-                         "function": {"name": c["name"],
-                                      "arguments": json.dumps(c["input"], ensure_ascii=False)}}
-                        for i, c in enumerate(parsed["calls"])
+                        {"id": call["id"], "type": "function",
+                         "function": {"name": call["name"],
+                                      "arguments": json.dumps(call["input"], ensure_ascii=False)}}
+                        for call in records
                     ]
                     _register_tool_ids([tc["id"] for tc in oai_tc], tid)
-                    return jsonify({
+                    response = jsonify({
                         "id": f"chatcmpl-{int(time.time()*1000)}",
                         "object": "chat.completion",
                         "choices": [{"index": 0,
@@ -1217,24 +1559,38 @@ def openai_compat():
                                      "finish_reason": "tool_calls"}],
                         "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok},
                     })
-                full_text = parsed.get("text", full_text)
+            else:
+                final_text = parsed.get("text", full_text) if client_tools else full_text
+                response = jsonify({
+                    "id": f"chatcmpl-{int(time.time()*1000)}",
+                    "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": final_text},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok},
+                })
+            _record_checkpoint(conversation_id, "response_buffered", stop_reason="sync")
+            response.headers["X-Conversation-Id"] = conversation_id
+            return response
 
-            return jsonify({
-                "id": f"chatcmpl-{int(time.time()*1000)}",
-                "object": "chat.completion",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": full_text},
-                             "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok},
-            })
-
-        def gen_oai(r):
+        def gen_oai(rsp):
             cid = f"chatcmpl-{int(time.time()*1000)}"
             if not client_tools:
-                yield from stream_openai(r, model, cid)
+                yield from stream_openai(rsp, model, cid)
                 return
-            full_text2, _, _ = _buffer_upstream_stream(r)
-            parsed2 = parse_tool_response(full_text2)
+            collected = _buffer_upstream_stream(rsp)
+            if collected["tool_calls"]:
+                parsed2 = {"type": "tool_calls", "calls": [{"name": c["name"], "input": c.get("input", {})} for c in collected["tool_calls"]]}
+            else:
+                if not collected["text"]:
+                    raise RuntimeError("upstream returned empty tool response")
+                parsed2 = parse_tool_response(collected["text"])
             if parsed2["type"] == "tool_calls":
+                _record_tool_calls(
+                    conversation_id,
+                    tid,
+                    key,
+                    [{"id": f"call_{i}", "name": c["name"], "input": c["input"]} for i, c in enumerate(parsed2["calls"])]
+                )
                 oai_tc2 = [
                     {"id": f"call_{i}", "type": "function",
                      "function": {"name": c["name"],
@@ -1245,20 +1601,20 @@ def openai_compat():
                 yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": oai_tc2}, "finish_reason": None}]})}\n\n'
                 yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})}\n\n'
             else:
-                t2 = parsed2.get("text", full_text2)
+                t2 = parsed2.get("text", collected["text"])
                 yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": t2}, "finish_reason": None}]})}\n\n'
                 yield f'data: {json.dumps({"id": cid, "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}\n\n'
             yield 'data: [DONE]\n\n'
 
+        _record_checkpoint(conversation_id, "response_streaming", stop_reason="stream")
         return Response(gen_oai(resp), mimetype="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Conversation-Id": conversation_id})
 
     except Exception as e:
-        log(f"❌ 接口异常: {e}", "ERROR")
+        log(f"? ????: {e}", "ERROR")
         return jsonify({"error": str(e)}), 502
 
 
-# ===================== 预热 =====================
 def warmup():
     """启动时为每个 key 创建 assistant，并按 key 填满 thread 池"""
     import threading
