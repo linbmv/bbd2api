@@ -442,6 +442,37 @@ def _restore_thread_binding(tid: str | None = None,
     return restored_tid, key
 
 
+def _recovery_text(conversation_id: str, text: str) -> str:
+    recovery = _recovery_context(conversation_id)
+    return (
+        "<recovery_context>\n"
+        f"conversation_id={conversation_id}\n"
+        f"recovery={json.dumps(recovery, ensure_ascii=False)}\n"
+        "Continue the unfinished work using the current workspace, diffs, checkpoints, and tool activity. Avoid repeating side effects.\n"
+        "</recovery_context>\n\n"
+        f"{text}"
+    )
+
+
+def _rebuild_and_retry_request(conversation_id: str,
+                               seed_messages: list,
+                               system_text: str,
+                               base_text: str,
+                               model: str,
+                               client_tools: list):
+    tid, text_to_send = get_or_create_thread(
+        seed_messages,
+        system_text,
+        conversation_id=conversation_id,
+        allow_persisted=False,
+    )
+    text_to_send = _recovery_text(conversation_id, base_text)
+    key = _request_key_for_thread(seed_messages, tid, conversation_id=conversation_id)
+    _remember_thread_binding(conversation_id, tid, key)
+    _, resp = _do_request(tid, key, text_to_send, True, model, client_tools)
+    return tid, key, resp
+
+
 
 def _request_key_for_thread(messages: list, tid: str, tool_result: bool = False,
                             conversation_id: str | None = None) -> str:
@@ -1456,6 +1487,30 @@ def claude_messages():
 
             response.headers["X-Conversation-Id"] = conversation_id
             return response
+
+        if bool(client_tools):
+            collected = _buffer_upstream_stream(resp)
+            if not collected["tool_calls"] and not collected["text"]:
+                log("empty tool response before streaming; rebuilding thread once", "WARNING")
+                _record_checkpoint(conversation_id, "empty_tool_response_retry", thread_id=tid)
+                tid, key, resp = _rebuild_and_retry_request(
+                    conversation_id,
+                    messages[-1:],
+                    sys_text,
+                    text_to_send,
+                    model,
+                    client_tools,
+                )
+            else:
+                fake_up = _tool_calls_to_fake_up(collected["tool_calls"], collected["input_tokens"], collected["output_tokens"]) if collected["tool_calls"] else {
+                    "content": collected["text"],
+                    "input_tokens": collected["input_tokens"],
+                    "output_tokens": collected["output_tokens"],
+                }
+                _record_checkpoint(conversation_id, "response_streaming", stop_reason="stream")
+                response = jsonify(_sync_response(fake_up, model, client_tools, tid))
+                response.headers["X-Conversation-Id"] = conversation_id
+                return response
 
         _record_checkpoint(conversation_id, "response_streaming", stop_reason="stream")
         return Response(stream_claude_with_tools(resp, model, bool(client_tools), tid),
