@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY server.py .
+COPY server.py conversation_store.py ./
 
 EXPOSE 10088
 
