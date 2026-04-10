@@ -1246,7 +1246,15 @@ def stream_claude(r, model: str, tid: str):
 
     # 关闭尚未关闭的 block
     if not saw_stream_output:
-        log('empty upstream non-tool stream', 'ERROR')
+        preview = ''
+        try:
+            preview = r.text[:500]
+        except Exception:
+            preview = ''
+        if preview:
+            log(f'empty upstream non-tool stream raw={preview}', 'ERROR')
+        else:
+            log('empty upstream non-tool stream', 'ERROR')
         yield _claude_text_delta(0, '[upstream returned empty stream]')
     if text_block_open:
         yield _claude_content_block_stop(0)
