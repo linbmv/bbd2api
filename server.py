@@ -1178,6 +1178,7 @@ def stream_claude(r, model: str, tid: str):
     yield _claude_ping()
 
     text_block_open = True
+    saw_stream_output = False
 
     with r:
         if r.status_code >= 500:
@@ -1204,6 +1205,7 @@ def stream_claude(r, model: str, tid: str):
                 elif etype == "content_streaming":
                     text = obj.get("content", "")
                     if text:
+                        saw_stream_output = True
                         if not text_block_open:
                             # 之前关闭了 text block（比如进入 tool），重新开一个
                             yield _claude_content_block_start(tool_index + 1, {"type": "text", "text": ""})
@@ -1243,6 +1245,9 @@ def stream_claude(r, model: str, tid: str):
                     break
 
     # 关闭尚未关闭的 block
+    if not saw_stream_output:
+        log('empty upstream non-tool stream', 'ERROR')
+        yield _claude_text_delta(0, '[upstream returned empty stream]')
     if text_block_open:
         yield _claude_content_block_stop(0)
 
