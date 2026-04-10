@@ -474,6 +474,45 @@ def _rebuild_and_retry_request(conversation_id: str,
 
 
 
+def _decode_tool_result_json(raw: str | None):
+    if not raw:
+        return ""
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return raw
+
+
+def _find_cached_tool_results(conversation_id: str, calls: list[dict]) -> list[dict]:
+    cached = []
+    for call in calls:
+        dedupe_key = _tool_dedupe_key(conversation_id, call["name"], call.get("input", {}))
+        row = conversation_store.get_completed_tool_result(conversation_id, dedupe_key)
+        if not row:
+            return []
+        cached.append({
+            "tool_use_id": call["id"],
+            "content": _decode_tool_result_json(row.get("result_json")),
+        })
+    return cached
+
+
+def _format_cached_tool_calls(conversation_id: str, calls: list[dict]) -> tuple[dict | None, list[dict]]:
+    records = []
+    for idx, call in enumerate(calls):
+        records.append({
+            "id": call.get("id") or f"cached_{idx}_{int(time.time()*1000)}",
+            "name": call["name"],
+            "input": call.get("input", {}),
+        })
+    cached = _find_cached_tool_results(conversation_id, records)
+    if len(cached) != len(records):
+        return None, records
+    replay_text = _format_tool_results([{"role": "tool", "content": entry["content"]} for entry in cached])
+    return {"type": "cached_tool_results", "text": replay_text}, records
+
+
+
 def _request_key_for_thread(messages: list, tid: str, tool_result: bool = False,
                             conversation_id: str | None = None) -> str:
     """为已存在 thread 确定其绑定 key。tool_result 场景需确保续接同一 key。"""
@@ -1145,6 +1184,9 @@ def stream_openai(r, model: str, cid: str):
             return
         r.raise_for_status()
         for line in r.iter_lines(decode_unicode=True):
+            if time.time() - start_at > max_wait:
+                log("upstream stream collection timed out before run_ended", "WARNING")
+                break
             if not line or not line.startswith("data: "):
                 continue
             raw = line[6:]
@@ -1207,7 +1249,7 @@ def _do_request(tid: str, api_key: str, text: str, stream: bool, model: str,
     try:
         if stream:
             resp = requests.post(url, headers=headers_for(api_key), json=payload,
-                                 stream=True, timeout=120)
+                                 stream=True, timeout=(15, 60))
         else:
             resp = requests.post(url, headers=headers_for(api_key), json=payload, timeout=90)
 
@@ -1261,10 +1303,17 @@ def _collect_upstream_stream(r) -> dict:
     tool_calls = []
     input_tokens = output_tokens = 0
     pending_tool = None
+    start_at = time.time()
+    max_wait = 45
+    start_at = time.time()
+    max_wait = 45
 
     with r:
         r.raise_for_status()
         for line in r.iter_lines(decode_unicode=True):
+            if time.time() - start_at > max_wait:
+                log("upstream stream collection timed out before run_ended", "WARNING")
+                break
             if not line or not line.startswith("data: "):
                 continue
             raw = line[6:]
