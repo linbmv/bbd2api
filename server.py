@@ -60,29 +60,108 @@ _key_index = 0
 _key_lock = Lock()
 _key_failures: dict[str, int] = {}   # key -> 连续失败次数
 _KEY_FAIL_THRESHOLD = 3              # 超过此次数暂时跳过该 key
+_dead_keys: set[str] = set()
+_FATAL_KEY_STATUS_CODES = {401, 403}
+
+
+def _http_status_from_error(err: Exception) -> int | None:
+    response = getattr(err, 'response', None)
+    if response is not None:
+        return getattr(response, 'status_code', None)
+    return None
+
+
+def _is_key_dead(key: str | None) -> bool:
+    if not key:
+        return False
+    with _key_lock:
+        return key in _dead_keys
+
+
+def _drop_key_runtime_state(key: str):
+    dead_tids = []
+    with lock:
+        assistant_map.pop(key, None)
+        dead_tids = [tid for tid, meta in thread_meta.items() if meta.get('api_key') == key]
+        cache_keys = [ck for ck, entry in thread_cache.items() if entry.get('api_key') == key]
+        for ck in cache_keys:
+            thread_cache.pop(ck, None)
+        for tid in dead_tids:
+            thread_meta.pop(tid, None)
+
+    with _pool_lock:
+        _thread_pool[key] = []
+
+    if dead_tids:
+        dead_tid_set = set(dead_tids)
+        with _tool_tid_lock:
+            stale_tool_ids = [uid for uid, tid in _tool_tid_map.items() if tid in dead_tid_set]
+            for uid in stale_tool_ids:
+                _tool_tid_map.pop(uid, None)
+
+
+def _drop_thread_runtime_state(tid: str):
+    with lock:
+        thread_meta.pop(tid, None)
+        cache_keys = [ck for ck, entry in thread_cache.items() if entry.get('thread_id') == tid]
+        for ck in cache_keys:
+            thread_cache.pop(ck, None)
+
+
+def _mark_key_dead(key: str, status_code: int | None = None, reason: str = ''):
+    with _key_lock:
+        already_dead = key in _dead_keys
+        _dead_keys.add(key)
+        _key_failures[key] = max(_key_failures.get(key, 0), _KEY_FAIL_THRESHOLD)
+
+    _drop_key_runtime_state(key)
+
+    if already_dead:
+        return
+
+    detail = f' status={status_code}' if status_code else ''
+    suffix = f': {reason}' if reason else ''
+    log(f'dead key quarantined ...{key[-8:]}{detail}{suffix}', 'ERROR')
 
 def _next_key() -> str:
     """Round-robin 取下一个可用 key，失败次数过多的暂时跳过"""
     global _key_index
+    if not API_KEYS:
+        raise RuntimeError('BBD_API_KEY is not configured')
     with _key_lock:
         n = len(API_KEYS)
+        fallback_keys = []
         for _ in range(n):
             key = API_KEYS[_key_index % n]
             _key_index += 1
+            if key in _dead_keys:
+                continue
             if _key_failures.get(key, 0) < _KEY_FAIL_THRESHOLD:
                 return key
-        # 全部 key 都超限了，重置并返回第一个
-        _key_failures.clear()
+            fallback_keys.append(key)
+        if not fallback_keys:
+            raise RuntimeError('no usable API keys available')
+        selected = min(fallback_keys, key=lambda item: _key_failures.get(item, 0))
         log("⚠️ 所有 key 均触发失败阈值，已重置计数", "WARNING")
-        return API_KEYS[0]
+        return selected
+
 
 def _mark_key_ok(key: str):
     with _key_lock:
+        if key in _dead_keys:
+            return
         _key_failures[key] = 0
 
-def _mark_key_fail(key: str):
+def _mark_key_fail(key: str, status_code: int | None = None, reason: str = ''):
+    if status_code in _FATAL_KEY_STATUS_CODES:
+        _mark_key_dead(key, status_code=status_code, reason=reason)
+        return
+
     with _key_lock:
+        if key in _dead_keys:
+            return
         _key_failures[key] = _key_failures.get(key, 0) + 1
+        failures = _key_failures[key]
         log(f"🔑 key ...{key[-8:]} 失败 {_key_failures[key]} 次", "WARNING")
 
 def headers_for(key: str) -> dict:
@@ -409,11 +488,11 @@ def _key_from_id(key_id: str | None) -> str | None:
     if not key_id:
         return None
     if key_id in API_KEYS:
-        return key_id
+        return None if _is_key_dead(key_id) else key_id
     suffix = key_id[3:] if key_id.startswith("...") else key_id
     for key in API_KEYS:
         if _key_suffix(key) == suffix or key.endswith(suffix):
-            return key
+            return None if _is_key_dead(key) else key
     return None
 
 
@@ -547,7 +626,7 @@ def _pool_fill_for_key(key: str, count: int):
         try:
             tids.append(_create_thread_for_key(key))
         except Exception as e:
-            _mark_key_fail(key)
+            _mark_key_fail(key, status_code=_http_status_from_error(e), reason=str(e))
             log(f"⚠️ 预热线程失败 key...{_key_suffix(key)}: {e}", "WARNING")
             break
     with _pool_lock:
@@ -562,7 +641,7 @@ def _warmup_all_keys():
             log(f"✅ assistant 就绪 key...{_key_suffix(key)} aid={aid}", "SUCCESS")
             _pool_fill_for_key(key, THREAD_POOL_SIZE)
         except Exception as e:
-            _mark_key_fail(key)
+            _mark_key_fail(key, status_code=_http_status_from_error(e), reason=str(e))
             log(f"⚠️ 预热失败 key...{_key_suffix(key)}: {e}", "WARNING")
 
     _debug_warmup_state()
@@ -629,7 +708,7 @@ def _create_thread_bg(key: str):
                 size = len(_thread_pool.get(key, []))
             log(f"🏊 pool+1 key...{_key_suffix(key)} tid={tid} size={size}", "DEBUG")
         except Exception as e:
-            _mark_key_fail(key)
+            _mark_key_fail(key, status_code=_http_status_from_error(e), reason=str(e))
             log(f"⚠️ pool 补充失败 key...{_key_suffix(key)}: {e}", "WARNING")
 
     threading.Thread(target=_do, daemon=True).start()
@@ -784,7 +863,7 @@ def get_or_create_thread(messages: list, system_text: str = "", conversation_id:
             return tid, user_text
         except Exception as e:
             last_err = e
-            _mark_key_fail(key)
+            _mark_key_fail(key, status_code=_http_status_from_error(e), reason=str(e))
             log(f"?? ?? thread ?? key...{_key_suffix(key)}: {e}", "WARNING")
 
     raise RuntimeError(f"???? thread: {last_err}")
@@ -1254,14 +1333,14 @@ def _do_request(tid: str, api_key: str, text: str, stream: bool, model: str,
             resp = requests.post(url, headers=headers_for(api_key), json=payload, timeout=90)
 
         if resp.status_code in (401, 403, 404):
-            _mark_key_fail(api_key)
+            _mark_key_fail(api_key, status_code=resp.status_code, reason='request failed')
         else:
             _mark_key_ok(api_key)
 
         return url, resp
 
     except requests.RequestException as e:
-        _mark_key_fail(api_key)
+        _mark_key_fail(api_key, status_code=_http_status_from_error(e), reason=str(e))
         raise
 
 
